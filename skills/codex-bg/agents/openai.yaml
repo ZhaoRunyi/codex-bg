@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex BG"
+  short_description: "Share one Codex thread across VS Code and background"
+  default_prompt: "Use $codex-bg to continue this thread on the shared daemon while VS Code may reconnect and steer it."

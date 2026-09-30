@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-default_prompt="搞清楚现状后，继续完成任务。默认使用中文与用户沟通。"
+default_prompt="Review the current state and continue the task in the user's language."
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 codex_home="${CODEX_HOME:-$HOME/.codex}"
 codex_binary="${CODEX_BINARY:-$codex_home/packages/standalone/current/codex}"

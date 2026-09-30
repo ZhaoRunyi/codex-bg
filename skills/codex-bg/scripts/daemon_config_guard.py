@@ -97,21 +97,11 @@ def daemon_pid(codex_home: pathlib.Path) -> dict:
 
 
 def required_daemon_environment() -> dict:
-    proxy_url = os.environ.get("CODEX_PROXY_URL", "http://127.0.0.1:17897")
-    all_proxy_url = os.environ.get(
-        "CODEX_ALL_PROXY_URL", "socks5h://127.0.0.1:17897"
-    )
-    no_proxy = os.environ.get("CODEX_NO_PROXY", "127.0.0.1,localhost,::1")
-    return {
-        "HTTP_PROXY": redact_url(proxy_url),
-        "HTTPS_PROXY": redact_url(proxy_url),
-        "ALL_PROXY": redact_url(all_proxy_url),
-        "NO_PROXY": no_proxy,
-        "http_proxy": redact_url(proxy_url),
-        "https_proxy": redact_url(proxy_url),
-        "all_proxy": redact_url(all_proxy_url),
-        "no_proxy": no_proxy,
-    }
+    environment = {}
+    for name in PROXY_ENV_NAMES:
+        value = os.environ.get(name)
+        environment[name] = value if "NO_PROXY" in name.upper() else redact_url(value)
+    return environment
 
 
 def daemon_environment(codex_home: pathlib.Path) -> dict:

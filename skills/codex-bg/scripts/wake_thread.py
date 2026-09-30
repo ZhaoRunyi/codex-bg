@@ -95,14 +95,12 @@ thread_changed = (
 prompt = args.prompt
 if thread_changed:
     prompt = (
-        "[codex-wake] 外部条件已满足，且等待期间 thread 收到了新消息。"
-        "请先重读完整对话，并把下列 watcher 任务作为一项独立、持续的责任来判断。"
-        "不要仅因出现更新消息就搁置它，也不要一味服从最后一条无关消息：无关消息"
-        "不影响本任务；新增约束或状态变化应被吸收并据此调整实现；若原条件、方案或"
-        "探针已过时，应取消旧 watcher、建立适配新情况的 watcher 并继续推进；只有"
-        "用户明确针对本任务取消、替换或确认完成时才终止。无法从任务作用域和对话"
-        "消解真实冲突、缺少必要授权或关键线索时，才停下询问。"
-        f"\n\nWatcher 任务：{prompt}"
+        "[codex-bg] The handoff became ready after this thread received a new message. "
+        "Reread the complete conversation before continuing. Absorb compatible constraints and "
+        "new state, and stop the handed-off task only if the user explicitly canceled, replaced, "
+        "or completed it. Ask only when the conversation cannot resolve a real scope conflict, "
+        "missing authority, or a critical missing fact."
+        f"\n\nHandoff task: {prompt}"
     )
 
 
@@ -129,8 +127,8 @@ async def main():
             "initialize",
             {
                 "clientInfo": {
-                    "name": "codex-wake",
-                    "title": "Codex Wake",
+                    "name": "codex-bg-handoff",
+                    "title": "Codex BG Handoff",
                     "version": "1.0.0",
                 },
                 "capabilities": {"experimentalApi": True},

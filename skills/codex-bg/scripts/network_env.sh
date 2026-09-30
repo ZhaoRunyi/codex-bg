@@ -14,4 +14,8 @@ prepare_codex_network() {
         export ALL_PROXY="$CODEX_ALL_PROXY_URL"
         export all_proxy="$CODEX_ALL_PROXY_URL"
     fi
+    if [[ -n "${CODEX_NO_PROXY:-}" ]]; then
+        export NO_PROXY="$CODEX_NO_PROXY"
+        export no_proxy="$CODEX_NO_PROXY"
+    fi
 }

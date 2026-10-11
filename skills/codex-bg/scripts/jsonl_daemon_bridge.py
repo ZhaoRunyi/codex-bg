@@ -9,17 +9,15 @@ import pathlib
 import sqlite3
 import sys
 import time
+import tomllib
 
 import websockets
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python 3.10
-    import tomli as tomllib
-
 
 def codex_home():
-    return pathlib.Path(os.environ.get("CODEX_HOME", pathlib.Path.home() / ".codex"))
+    return pathlib.Path(
+        os.environ.get("CODEX_HOME", pathlib.Path.home() / ".codex")
+    )
 
 
 def read_config():
@@ -81,6 +79,26 @@ def parse_rollout_meta(path):
     if row.get("type") != "session_meta":
         return {}
     return row.get("payload") or {}
+
+
+def rollout_path_for_thread(thread_id):
+    database_path = codex_home() / "state_5.sqlite"
+    try:
+        connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
+        try:
+            row = connection.execute(
+                "SELECT rollout_path FROM threads WHERE id = ?", (thread_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return None
+    if not row or not row[0]:
+        return None
+    rollout_path = pathlib.Path(row[0])
+    if not rollout_path.is_absolute() or not rollout_path.is_file():
+        return None
+    return str(rollout_path)
 
 
 def iso_from_unix(timestamp):
@@ -192,7 +210,13 @@ def augment_thread_list_response(message):
     return json.dumps(response, ensure_ascii=False)
 
 
-async def send_stdin(websocket, pending_thread_lists):
+async def send_stdin(
+    websocket,
+    pending_thread_lists,
+    pending_thread_resumes,
+    resume_thread_by_request,
+    resume_waiters,
+):
     reader = asyncio.StreamReader(limit=64 * 1024 * 1024)
     transport, _ = await asyncio.get_running_loop().connect_read_pipe(
         lambda: asyncio.StreamReaderProtocol(reader), sys.stdin.buffer
@@ -208,23 +232,56 @@ async def send_stdin(websocket, pending_thread_lists):
                 request_id = request.get("id")
                 if request_id is not None:
                     pending_thread_lists.add(request_id)
+            if isinstance(request, dict) and request.get("method") == "thread/resume":
+                request_id = request.get("id")
+                params = request.get("params")
+                thread_id = params.get("threadId") if isinstance(params, dict) else None
+                if thread_id and not params.get("path"):
+                    rollout_path = rollout_path_for_thread(thread_id)
+                    if rollout_path is not None:
+                        params["path"] = rollout_path
+                        message = json.dumps(request, ensure_ascii=False)
+                if request_id is not None and thread_id:
+                    primary_request_id = pending_thread_resumes.get(thread_id)
+                    if primary_request_id is not None:
+                        resume_waiters[primary_request_id].append(request_id)
+                        continue
+                    pending_thread_resumes[thread_id] = request_id
+                    resume_thread_by_request[request_id] = thread_id
+                    resume_waiters[request_id] = []
             await websocket.send(message)
     finally:
         transport.close()
 
 
-async def receive_stdout(websocket, pending_thread_lists):
+async def receive_stdout(
+    websocket,
+    pending_thread_lists,
+    pending_thread_resumes,
+    resume_thread_by_request,
+    resume_waiters,
+):
     async for message in websocket:
         if isinstance(message, bytes):
             message = message.decode()
         try:
-            response_id = json.loads(message).get("id")
+            response = json.loads(message)
+            response_id = response.get("id")
         except (AttributeError, json.JSONDecodeError):
+            response = None
             response_id = None
         if response_id in pending_thread_lists:
             pending_thread_lists.discard(response_id)
             message = augment_thread_list_response(message)
         sys.stdout.write(message + "\n")
+        if response_id in resume_waiters:
+            thread_id = resume_thread_by_request.pop(response_id, None)
+            if thread_id is not None:
+                pending_thread_resumes.pop(thread_id, None)
+            for waiter_id in resume_waiters.pop(response_id):
+                replay = dict(response)
+                replay["id"] = waiter_id
+                sys.stdout.write(json.dumps(replay, ensure_ascii=False) + "\n")
         sys.stdout.flush()
 
 
@@ -265,8 +322,27 @@ async def main():
         marker_temporary.write_text(f"{os.stat(socket_path).st_ino}\n")
         os.replace(marker_temporary, marker_path)
         pending_thread_lists = set()
-        sender = asyncio.create_task(send_stdin(websocket, pending_thread_lists))
-        receiver = asyncio.create_task(receive_stdout(websocket, pending_thread_lists))
+        pending_thread_resumes = {}
+        resume_thread_by_request = {}
+        resume_waiters = {}
+        sender = asyncio.create_task(
+            send_stdin(
+                websocket,
+                pending_thread_lists,
+                pending_thread_resumes,
+                resume_thread_by_request,
+                resume_waiters,
+            )
+        )
+        receiver = asyncio.create_task(
+            receive_stdout(
+                websocket,
+                pending_thread_lists,
+                pending_thread_resumes,
+                resume_thread_by_request,
+                resume_waiters,
+            )
+        )
         done, pending = await asyncio.wait(
             (sender, receiver),
             return_when=asyncio.FIRST_COMPLETED,

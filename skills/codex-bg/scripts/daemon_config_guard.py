@@ -8,12 +8,8 @@ import os
 import pathlib
 import tempfile
 import time
+import tomllib
 import urllib.parse
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python 3.10
-    import tomli as tomllib
 
 
 PROXY_ENV_NAMES = (
@@ -135,7 +131,7 @@ def snapshot(args: argparse.Namespace) -> dict:
     codex_home = pathlib.Path(args.codex_home)
     config_path = codex_home / "config.toml"
     auth_path = codex_home / "auth.json"
-    codex_binary = codex_home / "packages" / "standalone" / "current" / "codex"
+    codex_binary = codex_home / "packages" / "app-server-daemon" / "current" / "bin" / "codex"
     return {
         "recorded_at": time.time(),
         "codex_home": str(codex_home),
@@ -208,7 +204,9 @@ def check(args: argparse.Namespace) -> tuple[bool, dict]:
 
 
 def main() -> None:
-    codex_home = pathlib.Path(os.environ.get("CODEX_HOME", pathlib.Path.home() / ".codex"))
+    codex_home = pathlib.Path(
+        os.environ.get("CODEX_HOME", pathlib.Path.home() / ".codex")
+    )
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=["check", "record", "summary"])
     parser.add_argument("--codex-home", default=str(codex_home))

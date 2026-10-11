@@ -39,9 +39,22 @@ to refresh configuration.
 - Keep runtime state under `${CODEX_HOME:-$HOME/.codex}`. Do not commit credentials, rollouts,
   daemon sockets, markers, logs, or thread IDs.
 
+## Version and history safety
+
+`scripts/shared_codex.sh` runs `sync_vscode_codex.py ensure` before connecting the sidebar. The
+synchronizer patches only the newest supported remote extension, keeps the persistent daemon at the
+same bundled CLI version, and defers replacement whenever live RPC cannot prove every loaded thread
+idle. Runtime sockets, PID hints, and lifecycle locks are recreated under the current user's runtime
+directory; sessions, databases, auth, packages, backups, and scripts remain under `CODEX_HOME`.
+
+The JSONL bridge fills a missing rollout path for `thread/resume` from the read-only state catalog.
+Concurrent retries for the same thread are coalesced into one daemon request and the response is
+replayed under each frontend request ID. Do not rewrite or truncate a rollout to accelerate history
+hydration.
+
 ## Scope
 
-The bundled implementation targets Linux/POSIX hosts with VS Code Remote SSH, Git, Python 3.10+,
+The bundled implementation targets Linux/POSIX hosts with VS Code Remote SSH, Git, Python 3.11+,
 `screen`, and a Codex build that exposes `app-server daemon`. The sidebar setting used by this
 integration is an implementation surface rather than a stable cross-version promise; revalidate
 after every Codex or OpenAI VS Code extension upgrade.

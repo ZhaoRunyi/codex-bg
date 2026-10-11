@@ -3,9 +3,11 @@
 
 import argparse
 import asyncio
+import fcntl
 import json
 import os
 import pathlib
+import sqlite3
 import subprocess
 import sys
 import uuid
@@ -13,8 +15,12 @@ import uuid
 import websockets
 
 
-SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
-CODEX_HOME = pathlib.Path(os.environ.get("CODEX_HOME", pathlib.Path.home() / ".codex"))
+CODEX_HOME = pathlib.Path(
+    os.environ.get("CODEX_HOME", pathlib.Path.home() / ".codex")
+)
+CODEX_BG_ROOT = pathlib.Path(
+    os.environ.get("CODEX_BG_SKILL_ROOT", CODEX_HOME / "skills/codex-bg")
+)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--session-id", required=True)
@@ -25,7 +31,7 @@ parser.add_argument("--probe-only", action="store_true")
 parser.add_argument("--codex-home", default=str(CODEX_HOME))
 parser.add_argument(
     "--config-guard",
-    default=str(SCRIPT_DIR / "daemon_config_guard.py"),
+    default=str(CODEX_BG_ROOT / "scripts/daemon_config_guard.py"),
 )
 parser.add_argument(
     "--socket",
@@ -95,12 +101,14 @@ thread_changed = (
 prompt = args.prompt
 if thread_changed:
     prompt = (
-        "[codex-bg] The handoff became ready after this thread received a new message. "
-        "Reread the complete conversation before continuing. Absorb compatible constraints and "
-        "new state, and stop the handed-off task only if the user explicitly canceled, replaced, "
-        "or completed it. Ask only when the conversation cannot resolve a real scope conflict, "
-        "missing authority, or a critical missing fact."
-        f"\n\nHandoff task: {prompt}"
+        "[codex-wake] 外部条件已满足，且等待期间 thread 收到了新消息。"
+        "请先重读完整对话，并把下列 watcher 任务作为一项独立、持续的责任来判断。"
+        "不要仅因出现更新消息就搁置它，也不要一味服从最后一条无关消息：无关消息"
+        "不影响本任务；新增约束或状态变化应被吸收并据此调整实现；若原条件、方案或"
+        "探针已过时，应取消旧 watcher、建立适配新情况的 watcher 并继续推进；只有"
+        "用户明确针对本任务取消、替换或确认完成时才终止。无法从任务作用域和对话"
+        "消解真实冲突、缺少必要授权或关键线索时，才停下询问。"
+        f"\n\nWatcher 任务：{prompt}"
     )
 
 
@@ -112,6 +120,43 @@ async def request(websocket, request_id, method, params):
         message = json.loads(await websocket.recv())
         if message.get("id") == request_id:
             return message
+
+
+def acquire_resume_lock():
+    configured = os.environ.get("XDG_RUNTIME_DIR")
+    candidate = pathlib.Path(configured) if configured else pathlib.Path(f"/run/user/{os.getuid()}")
+    try:
+        info = candidate.stat()
+        runtime_root = candidate if candidate.is_dir() and info.st_uid == os.getuid() else None
+    except OSError:
+        runtime_root = None
+    if runtime_root is None:
+        runtime_root = pathlib.Path("/tmp") / f"codex-runtime-{os.getuid()}"
+        runtime_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(runtime_root, 0o700)
+    lock_directory = runtime_root / "codex-shared"
+    lock_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(lock_directory, 0o700)
+    lock_handle = (lock_directory / "wake-resume.lock").open("a+")
+    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+    return lock_handle
+
+
+def rollout_path_for_thread():
+    database = pathlib.Path(args.codex_home) / "state_5.sqlite"
+    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+    try:
+        row = connection.execute(
+            "SELECT rollout_path FROM threads WHERE id = ?", (args.session_id,)
+        ).fetchone()
+    finally:
+        connection.close()
+    if not row or not row[0]:
+        return None
+    rollout_path = pathlib.Path(row[0])
+    if not rollout_path.is_absolute() or not rollout_path.is_file():
+        return None
+    return str(rollout_path)
 
 
 async def main():
@@ -127,23 +172,56 @@ async def main():
             "initialize",
             {
                 "clientInfo": {
-                    "name": "codex-bg-handoff",
-                    "title": "Codex BG Handoff",
+                    "name": "codex-wake",
+                    "title": "Codex Wake",
                     "version": "1.0.0",
                 },
                 "capabilities": {"experimentalApi": True},
             },
         )
         await websocket.send(json.dumps({"method": "initialized", "params": {}}))
-        resumed = await request(
-            websocket,
-            2,
-            "thread/resume",
-            {"threadId": args.session_id},
-        )
-        if "error" in resumed:
-            raise RuntimeError(resumed["error"])
-        thread = resumed["result"]["thread"]
+        resume_lock = acquire_resume_lock()
+        try:
+            loaded = await request(websocket, 2, "thread/loaded/list", {})
+            if "error" in loaded:
+                raise RuntimeError(loaded["error"])
+            already_loaded = args.session_id in loaded.get("result", {}).get(
+                "data", []
+            )
+            if not already_loaded:
+                resume_params = {
+                    "threadId": args.session_id,
+                    "excludeTurns": True,
+                }
+                rollout_path = rollout_path_for_thread()
+                if rollout_path is not None:
+                    resume_params["path"] = rollout_path
+                resumed = await asyncio.wait_for(
+                    request(websocket, 3, "thread/resume", resume_params),
+                    timeout=900,
+                )
+                if "error" in resumed:
+                    raise RuntimeError(resumed["error"])
+            latest = await request(
+                websocket,
+                3 if already_loaded else 4,
+                "thread/turns/list",
+                {
+                    "threadId": args.session_id,
+                    "limit": 1,
+                    "sortDirection": "desc",
+                    "itemsView": "notLoaded",
+                },
+            )
+            if "error" in latest:
+                raise RuntimeError(latest["error"])
+            thread = {
+                "id": args.session_id,
+                "turns": latest.get("result", {}).get("data", []),
+            }
+        finally:
+            fcntl.flock(resume_lock.fileno(), fcntl.LOCK_UN)
+            resume_lock.close()
         if args.probe_only:
             print(
                 json.dumps(
@@ -173,7 +251,7 @@ async def main():
         if active_turn:
             response = await request(
                 websocket,
-                3,
+                5,
                 "turn/steer",
                 {
                     "threadId": args.session_id,
@@ -187,7 +265,7 @@ async def main():
         else:
             response = await request(
                 websocket,
-                3,
+                5,
                 "turn/start",
                 {
                     "threadId": args.session_id,

@@ -15,12 +15,11 @@ import time
 
 import websockets
 
-SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
-CODEX_HOME = pathlib.Path(os.environ.get("CODEX_HOME", pathlib.Path.home() / ".codex"))
-VSCODE_LOGS = os.environ.get(
-    "VSCODE_LOGS_ROOT",
-    str(pathlib.Path(os.environ.get("VSCODE_AGENT_FOLDER", pathlib.Path.home() / ".vscode-server")) / "data/logs"),
+
+CODEX_HOME = pathlib.Path(
+    os.environ.get("CODEX_HOME", pathlib.Path.home() / ".codex")
 )
+SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--session-id", required=True)
@@ -46,7 +45,10 @@ parser.add_argument(
 )
 parser.add_argument(
     "--vscode-logs",
-    default=VSCODE_LOGS,
+    default=os.environ.get(
+        "CODEX_VSCODE_LOG_ROOT",
+        str(pathlib.Path.home() / ".vscode-server/data/logs"),
+    ),
 )
 parser.add_argument("--rpc-timeout", type=float, default=30.0)
 parser.add_argument("--lock-timeout", type=float, default=5.0)

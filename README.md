@@ -24,9 +24,12 @@ Read `skills/codex-bg/references/setup.md` before changing the VS Code sidebar e
 currently targets Linux/POSIX remote hosts and VS Code Remote SSH. Revalidate it after Codex or the
 OpenAI VS Code extension is upgraded.
 
-The release was packaged and isolation-tested on 2026-09-30 against Codex CLI `0.153.0` and the
-OpenAI VS Code extension `26.901.22334`. Shared-daemon/sidebar behavior remains version-sensitive,
-so `skills/codex-bg/references/verification.md` is part of every upgrade.
+The current implementation was synchronized from a working Remote SSH deployment on 2026-10-11
+against Codex CLI `0.162.0-alpha.17.2` and the OpenAI VS Code extension
+`26.1007.21434-linux-x64`. The wrapper now reapplies its version-sensitive extension patch on
+activation and updates the persistent daemon from the newest installed extension only while every
+loaded thread is idle. `skills/codex-bg/references/verification.md` remains mandatory after every
+upgrade.
 
 ## Security and state
 

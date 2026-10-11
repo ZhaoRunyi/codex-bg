@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-default_prompt="Review the current state and continue the task in the user's language."
+default_prompt="搞清楚现状后，继续完成任务。默认使用中文与用户沟通。"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 codex_home="${CODEX_HOME:-$HOME/.codex}"
-codex_binary="${CODEX_BINARY:-$codex_home/packages/standalone/current/codex}"
+codex_binary="${CODEX_BINARY:-$codex_home/packages/app-server-daemon/current/bin/codex}"
+[[ -x "$codex_binary" ]] || codex_binary="$codex_home/packages/standalone/current/codex"
 [[ -x "$codex_binary" ]] || codex_binary="$(command -v codex || true)"
 python_binary="${CODEX_BG_PYTHON:-$codex_home/skill-runtimes/codex-bg/bin/python}"
 [[ -x "$python_binary" ]] || python_binary="$(command -v python3 || true)"
@@ -14,9 +15,13 @@ wake_script="$script_dir/wake_thread.py"
 bridge_script="$script_dir/jsonl_daemon_bridge.py"
 frontend_scope_script="$script_dir/frontend_scope.py"
 config_guard_script="$script_dir/daemon_config_guard.py"
-network_env_script="$script_dir/network_env.sh"
+proxy_env_script="${CODEX_BG_PROXY_ENV_SCRIPT:-$script_dir/codex_proxy_env.sh}"
+[[ -f "$proxy_env_script" ]] || {
+    echo "Codex proxy environment is unavailable: $proxy_env_script" >&2
+    exit 1
+}
 # shellcheck source=/dev/null
-source "$network_env_script"
+source "$proxy_env_script"
 session_id="${CODEX_THREAD_ID:-}"
 app_server_pid=""
 transport_pid=""
@@ -24,6 +29,7 @@ workdir="$PWD"
 prompt="$default_prompt"
 log_path=""
 screen_name=""
+local_mihomo=false
 proxy_url="${HTTPS_PROXY:-${https_proxy:-}}"
 dry_run=false
 run_child=false
@@ -121,6 +127,7 @@ Usage: start_handoff.sh [options]
   --log PATH
   --screen-name NAME
   --proxy-url URL
+  --local-mihomo
   --dry-run
 EOF
 }
@@ -135,6 +142,7 @@ while (($#)); do
         --log) log_path="$2"; shift 2 ;;
         --screen-name) screen_name="$2"; shift 2 ;;
         --proxy-url) proxy_url="$2"; shift 2 ;;
+        --local-mihomo) local_mihomo=true; shift ;;
         --dry-run) dry_run=true; shift ;;
         --run-child) run_child=true; shift ;;
         --shared-mode) shared_mode=true; shift ;;
@@ -196,7 +204,10 @@ if $dry_run; then
 fi
 
 mkdir -p "$state_dir"
-prepare_codex_network
+ensure_codex_proxy || {
+    echo "Codex persistent proxy is unavailable." >&2
+    exit 2
+}
 
 if ! $run_child; then
     frontend_bridge_ready || {
@@ -205,6 +216,14 @@ if ! $run_child; then
             --session-id "$session_id" --socket "$daemon_socket" >&2 || true
         exit 2
     }
+    if $local_mihomo; then
+        [[ -n "${CODEX_LOCAL_PROXY_PREPARE_COMMAND:-${CODEX_PROXY_PREPARE_COMMAND:-}}" ]] || {
+            echo "--local-mihomo requires CODEX_LOCAL_PROXY_PREPARE_COMMAND or CODEX_PROXY_PREPARE_COMMAND." >&2
+            exit 2
+        }
+        bash -lc "${CODEX_LOCAL_PROXY_PREPARE_COMMAND:-$CODEX_PROXY_PREPARE_COMMAND}"
+        proxy_url="${CODEX_PROXY_URL:-${HTTPS_PROXY:-${https_proxy:-}}}"
+    fi
     screen -ls | grep -Fq ".$screen_name" && {
         echo "Screen already exists: $screen_name" >&2
         exit 2

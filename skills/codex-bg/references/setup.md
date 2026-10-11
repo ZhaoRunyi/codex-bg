@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Linux/POSIX remote host with `bash`, `screen`, Python 3.10+, and Codex.
+- Linux/POSIX remote host with `bash`, `screen`, Python 3.11+, and Codex.
 - VS Code with the OpenAI Codex extension connected to that host.
 - The `codex-bg` skill installed at `${CODEX_HOME:-$HOME/.codex}/skills/codex-bg`.
 
@@ -18,9 +18,10 @@ equivalent Python environment already provides `websockets`.
 
 ## Configure the sidebar
 
-`chatgpt.cliExecutable` may have application scope in the installed extension. Use a dedicated
-VS Code `--user-data-dir` when isolation from other local windows is required. In that instance's
-User Settings, set:
+The wrapper's synchronizer changes `chatgpt.cliExecutable` to machine scope in the newest installed
+remote extension and patches its internal CLI fallback and frontend IPC path. It stores a backup
+under `${CODEX_HOME:-$HOME/.codex}/extension-backups`, then reapplies the patch after extension
+upgrades. In Remote Settings, set:
 
 ```json
 {
@@ -32,9 +33,16 @@ User Settings, set:
 VS Code JSON settings do not expand shell variables. Obtain the absolute path with
 `printf '%s\n' "${CODEX_HOME:-$HOME/.codex}"`.
 
-If a dedicated user-data directory is not possible, do not patch an installed extension silently.
-Explain the scope tradeoff and obtain approval before changing extension metadata or machine-wide
-settings. Extension upgrades can overwrite such a patch.
+Run the synchronizer once before the first reload:
+
+```bash
+"${CODEX_BG_PYTHON:-${CODEX_HOME:-$HOME/.codex}/skill-runtimes/codex-bg/bin/python}" \
+  "${CODEX_HOME:-$HOME/.codex}/skills/codex-bg/scripts/sync_vscode_codex.py" ensure
+```
+
+This is a host-wide Remote SSH integration for the current Unix account, not a per-workspace patch.
+Review that scope before installation. The patch-only watcher notices future extension versions but
+does not replace a live daemon; the next frontend activation performs an idle-only update.
 
 Run **Developer: Reload Window**. Confirm that the target window starts `shared_codex.sh`, not the
 extension's bundled `codex app-server` command.
@@ -45,3 +53,7 @@ Direct network access is the default. For a durable proxy, set `CODEX_PROXY_URL`
 `CODEX_ALL_PROXY_URL`, and optionally `CODEX_PROXY_PREPARE_COMMAND` in the environment that launches
 the remote extension host. Do not rely on a tunnel whose lifetime is tied to the SSH connection the
 background turn must survive.
+
+Keep the only persistent copy of Codex state and packages below `CODEX_HOME`. Socket, PID, and lock
+files are deliberately host-local and reconstructible; moving the persistent home to a new mount
+must not copy stale runtime locks.

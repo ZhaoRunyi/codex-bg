@@ -8,12 +8,15 @@ import fcntl
 import json
 import os
 import pathlib
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 
 import websockets
+
+from runtime_coordination import acquire_lock
 
 
 CODEX_HOME = pathlib.Path(
@@ -136,7 +139,26 @@ async def loaded_threads():
 
 
 async def resume_thread():
-    await daemon_request("thread/resume", {"threadId": args.session_id})
+    params = {"threadId": args.session_id, "excludeTurns": True}
+    database = CODEX_HOME / "state_5.sqlite"
+    try:
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+        try:
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(threads)")}
+            row = (
+                connection.execute(
+                    "SELECT rollout_path FROM threads WHERE id = ?", (args.session_id,)
+                ).fetchone()
+                if {"id", "rollout_path"}.issubset(columns)
+                else None
+            )
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        row = None
+    if row and row[0] and pathlib.Path(row[0]).is_absolute() and pathlib.Path(row[0]).is_file():
+        params["path"] = row[0]
+    await daemon_request("thread/resume", params)
 
 
 def run_rpc(coroutine):
@@ -263,6 +285,9 @@ def config_guard_reason():
         return (result.stdout or result.stderr or "daemon-config-stale").strip()
 
 
+# Keep automatic daemon replacement out of this ownership check and optional
+# read-only rehydration. The handle intentionally remains live until process exit.
+_daemon_operation = acquire_lock("daemon-operations.lock", exclusive=False)
 socket_path = pathlib.Path(args.socket)
 marker_path = pathlib.Path(args.bridge_marker)
 if not socket_path.is_socket():

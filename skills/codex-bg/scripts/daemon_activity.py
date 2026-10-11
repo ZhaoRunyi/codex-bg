@@ -9,6 +9,8 @@ import pathlib
 
 import websockets
 
+from runtime_coordination import shared_daemon_operation
+
 
 async def request(websocket, request_id, method, params):
     await websocket.send(
@@ -97,9 +99,10 @@ def main():
     args = parser.parse_args()
 
     try:
-        active_turns, idle_threads = asyncio.run(
-            asyncio.wait_for(inspect(args), timeout=30)
-        )
+        with shared_daemon_operation():
+            active_turns, idle_threads = asyncio.run(
+                asyncio.wait_for(inspect(args), timeout=30)
+            )
     except Exception as exc:
         print(
             json.dumps(

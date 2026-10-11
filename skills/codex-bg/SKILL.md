@@ -43,13 +43,15 @@ to refresh configuration.
 
 `scripts/shared_codex.sh` runs `sync_vscode_codex.py ensure` before connecting the sidebar. The
 synchronizer patches only the newest supported remote extension, keeps the persistent daemon at the
-same bundled CLI version, and defers replacement whenever live RPC cannot prove every loaded thread
-idle. Runtime sockets, PID hints, and lifecycle locks are recreated under the current user's runtime
-directory; sessions, databases, auth, packages, backups, and scripts remain under `CODEX_HOME`.
+same bundled CLI version, and defers replacement while any sidebar bridge, managed RPC client, or
+turn is active. The extension watcher retries a deferred update after those leases drain. Runtime
+sockets, PID hints, and lifecycle locks are recreated under the current user's runtime directory;
+sessions, databases, auth, packages, backups, and scripts remain under `CODEX_HOME`.
 
-The JSONL bridge fills a missing rollout path for `thread/resume` from the read-only state catalog.
-Concurrent retries for the same thread are coalesced into one daemon request and the response is
-replayed under each frontend request ID. Do not rewrite or truncate a rollout to accelerate history
+The JSONL bridge fills a missing rollout path for `thread/resume`, enforces `excludeTurns: true`, and
+coalesces only requests with identical effective parameters. Resume waiters expire instead of
+leaking indefinitely. Synthetic catalog rows are injected only on the first list page and preserve
+the daemon's pagination cursors. Do not rewrite or truncate a rollout to accelerate history
 hydration.
 
 ## Scope

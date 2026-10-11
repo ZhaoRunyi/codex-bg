@@ -10,11 +10,16 @@ After installing or upgrading Codex/the sidebar extension, verify in an expendab
 6. neither reconnect path sends a signal to the background process;
 7. changing Codex configuration restarts only an idle daemon and is refused during an active turn.
 8. the newest extension's bundled CLI and the managed daemon report the same version;
-9. two concurrent same-thread `thread/resume` requests cause one daemon resume and return under both
-   request IDs;
+9. two concurrent same-thread `thread/resume` requests with identical effective parameters cause
+   one daemon resume and return under both request IDs, while differing parameters remain separate;
 10. a `codex-wake` client resumes a large historical thread with catalog `path` plus `excludeTurns`,
     then loads only its newest turn without blocking unrelated daemon RPCs;
-11. an extension update during an active turn is patched but its daemon replacement is deferred.
+11. an extension update during an active turn, sidebar connection, or managed non-turn RPC is
+    patched but daemon replacement is deferred and retried after all leases drain;
+12. thread-list augmentation preserves daemon cursors and does not re-inject first-page rows on
+    later pages;
+13. `start_handoff.sh --dry-run` succeeds without a live transport, and the real initial handoff
+    refuses SIGKILL if graceful shutdown times out.
 
 Record the tested Codex CLI version, OpenAI VS Code extension version, host OS, and whether Remote SSH
 was used. The 2026-10-11 reference deployment passed the large-history resume test with an 849 MB

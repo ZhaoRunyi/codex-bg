@@ -19,8 +19,8 @@ equivalent Python environment already provides `websockets`.
 ## Configure the sidebar
 
 The wrapper's synchronizer changes `chatgpt.cliExecutable` to machine scope in the newest installed
-remote extension and patches its internal CLI fallback and frontend IPC path. It stores a backup
-under `${CODEX_HOME:-$HOME/.codex}/extension-backups`, then reapplies the patch after extension
+remote extension and patches its internal CLI fallback and frontend IPC path. It stores backups of
+both `package.json` and `extension.js` under `${CODEX_HOME:-$HOME/.codex}/extension-backups`, then reapplies the patch after extension
 upgrades. In Remote Settings, set:
 
 ```json
@@ -41,8 +41,9 @@ Run the synchronizer once before the first reload:
 ```
 
 This is a host-wide Remote SSH integration for the current Unix account, not a per-workspace patch.
-Review that scope before installation. The patch-only watcher notices future extension versions but
-does not replace a live daemon; the next frontend activation performs an idle-only update.
+Review that scope before installation. The watcher patches future extension versions immediately,
+then retries daemon replacement until sidebar, managed RPC, and active-turn leases are all idle.
+`sync_vscode_codex.py patch` never starts or replaces a daemon.
 
 Run **Developer: Reload Window**. Confirm that the target window starts `shared_codex.sh`, not the
 extension's bundled `codex app-server` command.

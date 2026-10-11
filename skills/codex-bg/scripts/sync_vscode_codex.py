@@ -14,6 +14,7 @@ import fcntl
 import json
 import os
 import pathlib
+import platform
 import re
 import shutil
 import signal
@@ -24,6 +25,8 @@ import time
 from typing import Any
 
 import websockets
+
+from runtime_coordination import acquire_lock, release_lock, runtime_directory
 
 
 CODEX_HOME = pathlib.Path(
@@ -51,21 +54,7 @@ MANAGED_CLI = CODEX_HOME / "packages/app-server-daemon/current/bin/codex"
 MANAGED_PID = CODEX_HOME / "app-server-daemon/app-server.pid"
 STAGING_ROOT = CODEX_HOME / "packages/app-server-daemon-staging"
 EXTENSION_BACKUPS = CODEX_HOME / "extension-backups"
-
-def runtime_base() -> pathlib.Path:
-    uid = os.getuid()
-    configured = os.environ.get("XDG_RUNTIME_DIR")
-    candidate = pathlib.Path(configured) if configured else pathlib.Path(f"/run/user/{uid}")
-    try:
-        info = candidate.stat()
-        if info.st_uid == uid and candidate.is_dir():
-            return candidate
-    except OSError:
-        pass
-    return pathlib.Path("/tmp") / f"codex-runtime-{uid}"
-
-
-RUNTIME_DIR = runtime_base() / "codex-shared"
+RUNTIME_DIR = runtime_directory()
 LIFECYCLE_LOCK = RUNTIME_DIR / "shared-codex-lifecycle.lock"
 WATCH_LOCK = RUNTIME_DIR / "extension-sync.lock"
 
@@ -87,19 +76,41 @@ def atomic_write(path: pathlib.Path, data: str, mode: int | None = None) -> None
 
 
 def version_key(name: str) -> tuple[int, ...]:
-    match = re.search(r"openai\.chatgpt-([0-9.]+)-linux-x64$", name)
+    match = re.search(r"openai\.chatgpt-([0-9.]+)-linux-(?:x64|arm64)$", name)
     return tuple(int(part) for part in match.group(1).split(".")) if match else ()
+
+
+def extension_binary_dir(extension: pathlib.Path) -> pathlib.Path | None:
+    machine = platform.machine().lower()
+    preferred = {
+        "x86_64": "linux-x86_64",
+        "amd64": "linux-x86_64",
+        "aarch64": "linux-aarch64",
+        "arm64": "linux-aarch64",
+    }.get(machine)
+    candidates = []
+    if preferred:
+        candidates.append(extension / "bin" / preferred)
+    candidates.extend(sorted((extension / "bin").glob("linux-*")))
+    seen = set()
+    for path in candidates:
+        if path in seen:
+            continue
+        seen.add(path)
+        required = [path / "codex", path / "codex-package.json"]
+        if all(item.is_file() for item in required):
+            return path
+    return None
 
 
 def installed_extensions() -> list[pathlib.Path]:
     candidates = []
-    for path in EXTENSION_ROOT.glob("openai.chatgpt-*-linux-x64"):
-        binary_dir = path / "bin/linux-x86_64"
+    for path in EXTENSION_ROOT.glob("openai.chatgpt-*-linux-*"):
         if (
             (path / "package.json").is_file()
             and (path / "out/extension.js").is_file()
-            and (binary_dir / "codex").is_file()
-            and (binary_dir / "codex-package.json").is_file()
+            and extension_binary_dir(path) is not None
+            and version_key(path.name)
         ):
             candidates.append(path)
     return sorted(candidates, key=lambda path: version_key(path.name), reverse=True)
@@ -122,12 +133,18 @@ def cli_version(cli: pathlib.Path) -> str | None:
 
 def patch_extension(extension: pathlib.Path) -> bool:
     changed = False
+    version = extension.name.removeprefix("openai.chatgpt-")
+    backup_dir = EXTENSION_BACKUPS / version
     package_path = extension / "package.json"
     package = json.loads(package_path.read_text())
     setting = package["contributes"]["configuration"]["properties"][
         "chatgpt.cliExecutable"
     ]
     if setting.get("scope") != "machine":
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        package_backup = backup_dir / "package.json"
+        if not package_backup.exists():
+            shutil.copy2(package_path, package_backup)
         setting["scope"] = "machine"
         atomic_write(
             package_path,
@@ -139,36 +156,57 @@ def patch_extension(extension: pathlib.Path) -> bool:
     javascript_path = extension / "out/extension.js"
     javascript = javascript_path.read_text()
     original = javascript
-    ipc_original = 'let t=sh.join(Vt(),"ipc");fa.mkdirSync(t,{mode:448,recursive:!0})'
-    ipc_patched = (
-        'let t=process.env.CODEX_VSCODE_IPC_DIR??sh.join('
-        'Q3e.tmpdir(),"codex-vscode-ipc",`uid-${process.getuid?.()??"unknown"}`);'
-        'fa.mkdirSync(t,{mode:448,recursive:!0})'
-    )
-    if ipc_original in javascript:
-        if javascript.count(ipc_original) != 1:
-            raise RuntimeError(f"ambiguous IPC patch target in {javascript_path}")
-        javascript = javascript.replace(ipc_original, ipc_patched)
-    elif ipc_patched not in javascript:
-        raise RuntimeError(f"unsupported IPC implementation in {javascript_path}")
+    if "CODEX_VSCODE_IPC_DIR" not in javascript:
+        ipc_pattern = re.compile(
+            r"let (?P<var>[A-Za-z_$][\w$]*)=(?P<join>[A-Za-z_$][\w$]*)\.join\("
+            r"(?P<base>[A-Za-z_$][\w$]*)\(\),[\"']ipc[\"']\);"
+            r"(?P<fs>[A-Za-z_$][\w$]*)\.mkdirSync\((?P=var),"
+            r"\{mode:448,recursive:!0\}\)"
+        )
+        matches = list(ipc_pattern.finditer(javascript))
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"expected one semantic IPC patch target in {javascript_path}, found {len(matches)}"
+            )
+        match = matches[0]
+        ipc_patched = (
+            f"let {match['var']}=process.env.CODEX_VSCODE_IPC_DIR??{match['join']}.join("
+            f'process.env.XDG_RUNTIME_DIR??"/tmp","codex-vscode-ipc",'
+            f'`uid-${{process.getuid?.()??"unknown"}}`);'
+            f"{match['fs']}.mkdirSync({match['var']},{{mode:448,recursive:!0}})"
+        )
+        javascript = javascript[: match.start()] + ipc_patched + javascript[match.end() :]
 
-    cli_original = (
-        'let n=to("cliExecutable");if(n&&n.trim().length>0)return n;let o=Ib(e)'
-    )
-    cli_patched = (
-        'let n=to("cliExecutable");if(n&&n.trim().length>0)return n;'
-        f'return"{WRAPPER}";let o=Ib(e)'
-    )
-    if cli_original in javascript:
-        if javascript.count(cli_original) != 1:
-            raise RuntimeError(f"ambiguous CLI patch target in {javascript_path}")
-        javascript = javascript.replace(cli_original, cli_patched)
-    elif cli_patched not in javascript:
-        raise RuntimeError(f"unsupported CLI selection implementation in {javascript_path}")
+    wrapper_literal = json.dumps(str(WRAPPER))
+    if str(WRAPPER) not in javascript:
+        prior_wrapper_pattern = re.compile(
+            r"return(?P<path>[\"'][^\"']*/shared_codex\.sh[\"']);let "
+        )
+        prior_matches = list(prior_wrapper_pattern.finditer(javascript))
+        if len(prior_matches) == 1:
+            match = prior_matches[0]
+            replacement = f"return{wrapper_literal};let "
+            javascript = javascript[: match.start()] + replacement + javascript[match.end() :]
+        else:
+            cli_pattern = re.compile(
+                r"let (?P<value>[A-Za-z_$][\w$]*)=(?P<setting>[A-Za-z_$][\w$]*)"
+                r"\([\"']cliExecutable[\"']\);if\((?P=value)&&(?P=value)\.trim\(\)"
+                r"\.length>0\)return (?P=value);let (?P<fallback>[A-Za-z_$][\w$]*)="
+            )
+            matches = list(cli_pattern.finditer(javascript))
+            if len(matches) != 1:
+                raise RuntimeError(
+                    f"expected one semantic CLI patch target in {javascript_path}, found {len(matches)}"
+                )
+            match = matches[0]
+            replacement = match.group(0).replace(
+                f";let {match['fallback']}=",
+                f";return{wrapper_literal};let {match['fallback']}=",
+            )
+            javascript = javascript[: match.start()] + replacement + javascript[match.end() :]
 
     if javascript != original:
-        version = extension.name.removeprefix("openai.chatgpt-")
-        backup = EXTENSION_BACKUPS / version / "extension.js"
+        backup = backup_dir / "extension.js"
         if not backup.exists():
             backup.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(javascript_path, backup)
@@ -342,7 +380,9 @@ def stop_daemon(socket_path: pathlib.Path, runtime_pid: pathlib.Path) -> None:
 
 
 def stage_extension_package(extension: pathlib.Path, version: str) -> pathlib.Path:
-    source = extension / "bin/linux-x86_64"
+    source = extension_binary_dir(extension)
+    if source is None:
+        raise RuntimeError(f"no compatible bundled Codex package in {extension}")
     manifest = json.loads((source / "codex-package.json").read_text())
     target = manifest.get("target", "unknown-target")
     final = STAGING_ROOT / f"{version}-{target}"
@@ -352,10 +392,14 @@ def stage_extension_package(extension: pathlib.Path, version: str) -> pathlib.Pa
     temporary.mkdir(parents=True, exist_ok=False)
     (temporary / "bin").mkdir()
     shutil.copy2(source / "codex", temporary / "bin/codex")
-    shutil.copy2(source / "codex-code-mode-host", temporary / "bin/codex-code-mode-host")
+    code_mode_host = source / "codex-code-mode-host"
+    if code_mode_host.is_file():
+        shutil.copy2(code_mode_host, temporary / "bin/codex-code-mode-host")
     shutil.copy2(source / "codex-package.json", temporary / "codex-package.json")
-    shutil.copytree(source / "codex-resources", temporary / "codex-resources")
-    shutil.copytree(source / "codex-path", temporary / "codex-path")
+    for directory_name in ("codex-resources", "codex-path"):
+        source_directory = source / directory_name
+        if source_directory.is_dir():
+            shutil.copytree(source_directory, temporary / directory_name)
     os.replace(temporary, final)
     return final
 
@@ -464,7 +508,10 @@ def sync_once(allow_update: bool) -> dict[str, Any]:
         raise RuntimeError(f"no supported Codex extension found below {EXTENSION_ROOT}")
     extension = extensions[0]
     patch_extension(extension)
-    bundled_cli = extension / "bin/linux-x86_64/codex"
+    binary_dir = extension_binary_dir(extension)
+    if binary_dir is None:
+        raise RuntimeError(f"no compatible bundled Codex package in {extension}")
+    bundled_cli = binary_dir / "codex"
     bundled_version = cli_version(bundled_cli)
     if bundled_version is None:
         raise RuntimeError(f"cannot read bundled CLI version: {bundled_cli}")
@@ -474,23 +521,39 @@ def sync_once(allow_update: bool) -> dict[str, Any]:
     updated = False
     deferred = False
     if managed_version != bundled_version:
-        idle, threads = daemon_is_idle(socket_path)
-        if not allow_update or not idle:
-            deferred = True
-            emit(
-                "daemon_update_deferred",
-                bundled_version=bundled_version,
-                managed_version=managed_version,
-                reason="active-turn" if not idle else "patch-only-mode",
-                threads=threads,
-            )
-        else:
-            stop_daemon(socket_path, runtime_pid)
-            install_extension_package(extension, bundled_version)
-            socket_path, runtime_pid = ensure_runtime()
-            start_daemon(socket_path, runtime_pid)
-            managed_version = cli_version(MANAGED_CLI)
-            updated = True
+        client_lock = None
+        operation_lock = None
+        try:
+            client_lock = acquire_lock("frontend-clients.lock", exclusive=True, blocking=False)
+            operation_lock = acquire_lock("daemon-operations.lock", exclusive=True, blocking=False)
+            idle, threads = daemon_is_idle(socket_path)
+            if not allow_update or client_lock is None or operation_lock is None or not idle:
+                deferred = True
+                if not allow_update:
+                    reason = "patch-only-mode"
+                elif client_lock is None:
+                    reason = "frontend-connected"
+                elif operation_lock is None:
+                    reason = "daemon-rpc-active"
+                else:
+                    reason = "active-turn"
+                emit(
+                    "daemon_update_deferred",
+                    bundled_version=bundled_version,
+                    managed_version=managed_version,
+                    reason=reason,
+                    threads=threads,
+                )
+            else:
+                stop_daemon(socket_path, runtime_pid)
+                install_extension_package(extension, bundled_version)
+                socket_path, runtime_pid = ensure_runtime()
+                start_daemon(socket_path, runtime_pid)
+                managed_version = cli_version(MANAGED_CLI)
+                updated = True
+        finally:
+            release_lock(operation_lock)
+            release_lock(client_lock)
 
     if not socket_path.is_socket():
         start_daemon(socket_path, runtime_pid)
@@ -536,11 +599,14 @@ def extension_fingerprint() -> tuple[Any, ...]:
     if not extensions:
         return ()
     extension = extensions[0]
+    binary_dir = extension_binary_dir(extension)
+    if binary_dir is None:
+        return (str(extension), "unsupported-binary-layout")
     files = [
         extension / "package.json",
         extension / "out/extension.js",
-        extension / "bin/linux-x86_64/codex-package.json",
-        extension / "bin/linux-x86_64/codex",
+        binary_dir / "codex-package.json",
+        binary_dir / "codex",
     ]
     fingerprint: list[Any] = [str(extension)]
     for path in files:
@@ -565,11 +631,12 @@ def watch(interval: int) -> None:
                     time.sleep(interval)
                     continue
                 rotate_watch_log()
-                result = locked_sync(allow_update=False, blocking=False)
+                result = locked_sync(allow_update=True, blocking=False)
                 if result is not None:
                     with WATCH_LOG.open("a") as log:
                         log.write(json.dumps({"time": time.time(), **result}, sort_keys=True) + "\n")
-                    previous_fingerprint = extension_fingerprint()
+                    if not result.get("deferred"):
+                        previous_fingerprint = extension_fingerprint()
             except Exception as exc:
                 with WATCH_LOG.open("a") as log:
                     log.write(
@@ -592,6 +659,13 @@ def main() -> None:
 
     if args.command == "watch":
         watch(max(10, args.interval))
+        return
+    if args.command == "patch":
+        extensions = installed_extensions()
+        if not extensions:
+            raise RuntimeError(f"no supported Codex extension found below {EXTENSION_ROOT}")
+        changed = patch_extension(extensions[0])
+        emit("patch_complete", extension=str(extensions[0]), changed=changed)
         return
     result = locked_sync(allow_update=args.command == "ensure")
     emit("sync_complete", **(result or {"skipped": "lifecycle-lock-busy"}))

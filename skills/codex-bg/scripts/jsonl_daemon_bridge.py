@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Bridge VS Code's JSONL stdio transport to a shared app-server WebSocket."""
 
+from __future__ import annotations
+
 import asyncio
 import datetime
 import json
@@ -10,82 +12,80 @@ import sqlite3
 import sys
 import time
 import tomllib
+from typing import Any
 
 import websockets
 
-
-def codex_home():
-    return pathlib.Path(
-        os.environ.get("CODEX_HOME", pathlib.Path.home() / ".codex")
-    )
+from runtime_coordination import frontend_client
 
 
-def read_config():
-    config_path = codex_home() / "config.toml"
+def codex_home() -> pathlib.Path:
+    return pathlib.Path(os.environ.get("CODEX_HOME", pathlib.Path.home() / ".codex"))
+
+
+def read_config() -> dict:
     try:
-        return tomllib.loads(config_path.read_text())
+        return tomllib.loads((codex_home() / "config.toml").read_text())
     except (OSError, tomllib.TOMLDecodeError):
         return {}
 
 
-def workspace_candidates():
-    candidates = [
-        os.environ.get("CODEX_WORKSPACE_ROOT"),
-        os.getcwd(),
-    ]
+def workspace_candidates() -> list[str]:
+    candidates = [os.environ.get("CODEX_WORKSPACE_ROOT"), os.getcwd()]
     candidates.extend(read_config().get("projects", {}).keys())
     workspaces = []
     seen = set()
     for candidate in candidates:
-        if not candidate:
-            continue
-        workspace = str(pathlib.Path(candidate).resolve())
-        if workspace not in seen:
-            seen.add(workspace)
-            workspaces.append(workspace)
+        if candidate:
+            workspace = str(pathlib.Path(candidate).resolve())
+            if workspace not in seen:
+                seen.add(workspace)
+                workspaces.append(workspace)
     return workspaces
 
 
-def current_provider_key():
-    config = read_config()
-    provider = config.get("model_provider") or "openai"
-    return str(provider).lower()
+def current_provider_key() -> str:
+    return str(read_config().get("model_provider") or "openai").lower()
 
 
-def latest_thread_names():
-    index_path = codex_home() / "session_index.jsonl"
+def latest_thread_names() -> dict[str, str]:
     names = {}
     try:
-        for line in index_path.read_text(errors="replace").splitlines():
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            thread_id = row.get("id")
-            thread_name = row.get("thread_name")
-            if thread_id and thread_name:
-                names[thread_id] = thread_name
+        lines = (codex_home() / "session_index.jsonl").read_text(errors="replace").splitlines()
     except OSError:
-        pass
+        return names
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("id") and row.get("thread_name"):
+            names[row["id"]] = row["thread_name"]
     return names
 
 
-def parse_rollout_meta(path):
+def parse_rollout_meta(path: str | None) -> dict:
+    if not path:
+        return {}
     try:
         with pathlib.Path(path).open(encoding="utf-8", errors="replace") as handle:
             row = json.loads(handle.readline())
     except (OSError, json.JSONDecodeError):
         return {}
-    if row.get("type") != "session_meta":
-        return {}
-    return row.get("payload") or {}
+    return row.get("payload") or {} if row.get("type") == "session_meta" else {}
 
 
-def rollout_path_for_thread(thread_id):
+def thread_table_columns(connection: sqlite3.Connection) -> set[str]:
+    return {row[1] for row in connection.execute("PRAGMA table_info(threads)")}
+
+
+def rollout_path_for_thread(thread_id: str) -> str | None:
     database_path = codex_home() / "state_5.sqlite"
     try:
         connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
         try:
+            if not {"id", "rollout_path"}.issubset(thread_table_columns(connection)):
+                return None
             row = connection.execute(
                 "SELECT rollout_path FROM threads WHERE id = ?", (thread_id,)
             ).fetchone()
@@ -95,13 +95,11 @@ def rollout_path_for_thread(thread_id):
         return None
     if not row or not row[0]:
         return None
-    rollout_path = pathlib.Path(row[0])
-    if not rollout_path.is_absolute() or not rollout_path.is_file():
-        return None
-    return str(rollout_path)
+    path = pathlib.Path(row[0])
+    return str(path) if path.is_absolute() and path.is_file() else None
 
 
-def iso_from_unix(timestamp):
+def iso_from_unix(timestamp: int | float) -> str:
     return (
         datetime.datetime.fromtimestamp(timestamp, datetime.UTC)
         .isoformat(timespec="milliseconds")
@@ -109,47 +107,69 @@ def iso_from_unix(timestamp):
     )
 
 
-def synthetic_thread_rows(existing_ids):
+SYNTHETIC_FIELDS: dict[str, str] = {
+    "created_at": "0",
+    "updated_at": "0",
+    "source": "'vscode'",
+    "model_provider": "'openai'",
+    "title": "NULL",
+    "cli_version": "NULL",
+    "thread_source": "NULL",
+    "preview": "''",
+    "recency_at": "0",
+    "history_mode": "'legacy'",
+    "agent_nickname": "NULL",
+    "agent_role": "NULL",
+    "git_sha": "NULL",
+    "git_branch": "NULL",
+    "git_origin_url": "NULL",
+}
+
+
+def synthetic_thread_rows(existing_ids: set[str], limit: int = 200) -> list[dict]:
     database_path = codex_home() / "state_5.sqlite"
-    if not database_path.is_file():
-        return []
     workspaces = workspace_candidates()
-    if not workspaces:
+    if not database_path.is_file() or not workspaces:
         return []
-    provider_key = current_provider_key()
     names = latest_thread_names()
-    workspace_placeholders = ", ".join("?" for _ in workspaces)
-    query = """
-        SELECT
-            id, rollout_path, created_at, updated_at, source, model_provider,
-            cwd, title, cli_version, thread_source, preview, recency_at,
-            history_mode, agent_nickname, agent_role, git_sha, git_branch,
-            git_origin_url
-        FROM threads
-        WHERE archived = 0
-          AND source = 'vscode'
-          AND cwd IN ({workspace_placeholders})
-          AND lower(model_provider) = ?
-          AND (thread_source IS NULL OR thread_source = 'user')
-    """.format(workspace_placeholders=workspace_placeholders)
-    rows = []
     try:
         connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
         connection.row_factory = sqlite3.Row
         try:
-            result_rows = list(connection.execute(query, (*workspaces, provider_key)))
+            columns = thread_table_columns(connection)
+            required = {"id", "rollout_path", "cwd", "model_provider"}
+            if not required.issubset(columns):
+                return []
+            selects = ["id", "rollout_path", "cwd"]
+            for field, default in SYNTHETIC_FIELDS.items():
+                selects.append(field if field in columns else f"{default} AS {field}")
+            conditions = [f"cwd IN ({', '.join('?' for _ in workspaces)})", "lower(model_provider) = ?"]
+            parameters: list[Any] = [*workspaces, current_provider_key()]
+            if "archived" in columns:
+                conditions.append("archived = 0")
+            if "source" in columns:
+                conditions.append("source = 'vscode'")
+            if "thread_source" in columns:
+                conditions.append("(thread_source IS NULL OR thread_source = 'user')")
+            order = "recency_at" if "recency_at" in columns else "updated_at"
+            if order not in columns:
+                order = "created_at" if "created_at" in columns else "id"
+            query = (
+                f"SELECT {', '.join(selects)} FROM threads WHERE {' AND '.join(conditions)} "
+                f"ORDER BY {order} DESC LIMIT ?"
+            )
+            result_rows = list(connection.execute(query, (*parameters, limit)))
         finally:
             connection.close()
     except sqlite3.Error:
         return []
+
+    rows = []
     for row in result_rows:
         thread_id = row["id"]
         if thread_id in existing_ids:
             continue
         metadata = parse_rollout_meta(row["rollout_path"])
-        thread_source = row["thread_source"]
-        if thread_source in (None, "user"):
-            thread_source = None
         git_info = None
         if row["git_sha"] or row["git_branch"] or row["git_origin_url"]:
             git_info = {
@@ -176,7 +196,7 @@ def synthetic_thread_rows(existing_ids):
                 "cwd": row["cwd"],
                 "cliVersion": row["cli_version"],
                 "source": row["source"],
-                "threadSource": thread_source,
+                "threadSource": None if row["thread_source"] in (None, "user") else row["thread_source"],
                 "agentNickname": row["agent_nickname"],
                 "agentRole": row["agent_role"],
                 "gitInfo": git_info,
@@ -187,7 +207,13 @@ def synthetic_thread_rows(existing_ids):
     return rows
 
 
-def augment_thread_list_response(message):
+def is_first_thread_page(params: dict) -> bool:
+    return not any(params.get(name) for name in ("cursor", "backwardsCursor"))
+
+
+def augment_thread_list_response(
+    message: str, params: dict, injected_thread_ids: set[str]
+) -> str:
     try:
         response = json.loads(message)
     except json.JSONDecodeError:
@@ -196,27 +222,59 @@ def augment_thread_list_response(message):
     if not isinstance(result, dict) or not isinstance(result.get("data"), list):
         return message
     data = result["data"]
+    if not is_first_thread_page(params):
+        result["data"] = [
+            row for row in data if not isinstance(row, dict) or row.get("id") not in injected_thread_ids
+        ]
+        return json.dumps(response, ensure_ascii=False)
+
     existing_ids = {row.get("id") for row in data if isinstance(row, dict)}
-    synthetic_rows = synthetic_thread_rows(existing_ids)
+    requested_limit = params.get("limit", 50)
+    try:
+        synthetic_limit = max(1, min(int(requested_limit) * 4, 200))
+    except (TypeError, ValueError):
+        synthetic_limit = 200
+    synthetic_rows = synthetic_thread_rows(existing_ids, synthetic_limit)
     if not synthetic_rows:
         return message
     data.extend(synthetic_rows)
+    injected_thread_ids.update(row["id"] for row in synthetic_rows)
     data.sort(key=lambda row: row.get("recencyAt") or row.get("updatedAt") or 0, reverse=True)
-    result["nextCursor"] = None
-    if data:
+    # Preserve the daemon's cursors exactly; synthetic first-page rows must not destroy pagination.
+    if data and "backwardsCursor" not in result:
         oldest_created_at = min(row.get("createdAt") or 0 for row in data)
         if oldest_created_at:
             result["backwardsCursor"] = iso_from_unix(oldest_created_at)
     return json.dumps(response, ensure_ascii=False)
 
 
-async def send_stdin(
-    websocket,
-    pending_thread_lists,
-    pending_thread_resumes,
-    resume_thread_by_request,
-    resume_waiters,
-):
+def canonical_resume_key(params: dict) -> str:
+    return json.dumps(params, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+async def expire_resume(
+    primary_id: Any,
+    timeout: float,
+    pending_resumes: dict[str, Any],
+    resume_key_by_request: dict[Any, str],
+    resume_waiters: dict[Any, list[Any]],
+) -> None:
+    await asyncio.sleep(timeout)
+    key = resume_key_by_request.pop(primary_id, None)
+    if key is None:
+        return
+    pending_resumes.pop(key, None)
+    ids = [primary_id, *resume_waiters.pop(primary_id, [])]
+    for request_id in ids:
+        error = {
+            "id": request_id,
+            "error": {"code": -32001, "message": f"thread/resume timed out after {timeout:g}s"},
+        }
+        sys.stdout.write(json.dumps(error, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+async def send_stdin(websocket, state: dict) -> None:
     reader = asyncio.StreamReader(limit=64 * 1024 * 1024)
     transport, _ = await asyncio.get_running_loop().connect_read_pipe(
         lambda: asyncio.StreamReaderProtocol(reader), sys.stdin.buffer
@@ -229,38 +287,42 @@ async def send_stdin(
             except json.JSONDecodeError:
                 request = None
             if isinstance(request, dict) and request.get("method") == "thread/list":
-                request_id = request.get("id")
-                if request_id is not None:
-                    pending_thread_lists.add(request_id)
+                if request.get("id") is not None:
+                    state["thread_lists"][request["id"]] = request.get("params") or {}
             if isinstance(request, dict) and request.get("method") == "thread/resume":
                 request_id = request.get("id")
                 params = request.get("params")
                 thread_id = params.get("threadId") if isinstance(params, dict) else None
-                if thread_id and not params.get("path"):
-                    rollout_path = rollout_path_for_thread(thread_id)
-                    if rollout_path is not None:
-                        params["path"] = rollout_path
-                        message = json.dumps(request, ensure_ascii=False)
                 if request_id is not None and thread_id:
-                    primary_request_id = pending_thread_resumes.get(thread_id)
-                    if primary_request_id is not None:
-                        resume_waiters[primary_request_id].append(request_id)
+                    if not params.get("path"):
+                        path = rollout_path_for_thread(thread_id)
+                        if path is not None:
+                            params["path"] = path
+                    params["excludeTurns"] = True
+                    message = json.dumps(request, ensure_ascii=False)
+                    key = canonical_resume_key(params)
+                    primary_id = state["pending_resumes"].get(key)
+                    if primary_id is not None:
+                        state["resume_waiters"][primary_id].append(request_id)
                         continue
-                    pending_thread_resumes[thread_id] = request_id
-                    resume_thread_by_request[request_id] = thread_id
-                    resume_waiters[request_id] = []
+                    state["pending_resumes"][key] = request_id
+                    state["resume_key_by_request"][request_id] = key
+                    state["resume_waiters"][request_id] = []
+                    state["resume_timeouts"][request_id] = asyncio.create_task(
+                        expire_resume(
+                            request_id,
+                            state["resume_timeout"],
+                            state["pending_resumes"],
+                            state["resume_key_by_request"],
+                            state["resume_waiters"],
+                        )
+                    )
             await websocket.send(message)
     finally:
         transport.close()
 
 
-async def receive_stdout(
-    websocket,
-    pending_thread_lists,
-    pending_thread_resumes,
-    resume_thread_by_request,
-    resume_waiters,
-):
+async def receive_stdout(websocket, state: dict) -> None:
     async for message in websocket:
         if isinstance(message, bytes):
             message = message.decode()
@@ -270,32 +332,32 @@ async def receive_stdout(
         except (AttributeError, json.JSONDecodeError):
             response = None
             response_id = None
-        if response_id in pending_thread_lists:
-            pending_thread_lists.discard(response_id)
-            message = augment_thread_list_response(message)
+        list_params = state["thread_lists"].pop(response_id, None)
+        if list_params is not None:
+            message = augment_thread_list_response(message, list_params, state["injected_ids"])
         sys.stdout.write(message + "\n")
-        if response_id in resume_waiters:
-            thread_id = resume_thread_by_request.pop(response_id, None)
-            if thread_id is not None:
-                pending_thread_resumes.pop(thread_id, None)
-            for waiter_id in resume_waiters.pop(response_id):
+        if response_id in state["resume_waiters"]:
+            timeout_task = state["resume_timeouts"].pop(response_id, None)
+            if timeout_task is not None:
+                timeout_task.cancel()
+            key = state["resume_key_by_request"].pop(response_id, None)
+            if key is not None:
+                state["pending_resumes"].pop(key, None)
+            for waiter_id in state["resume_waiters"].pop(response_id):
                 replay = dict(response)
                 replay["id"] = waiter_id
                 sys.stdout.write(json.dumps(replay, ensure_ascii=False) + "\n")
         sys.stdout.flush()
 
 
-async def connect_websocket(socket_path):
+async def connect_websocket(socket_path: str):
     wait_for_socket = os.environ.get("CODEX_BRIDGE_WAIT_FOR_SOCKET") == "1"
     deadline = time.monotonic() + 360
     backoff = 0.02
     while True:
         try:
             return await websockets.unix_connect(
-                socket_path,
-                uri="ws://localhost",
-                compression=None,
-                max_size=None,
+                socket_path, uri="ws://localhost", compression=None, max_size=None
             )
         except OSError:
             if not wait_for_socket or time.monotonic() >= deadline:
@@ -304,7 +366,7 @@ async def connect_websocket(socket_path):
             backoff = min(backoff * 2, 0.5)
 
 
-async def main():
+async def run_bridge() -> None:
     socket_path = os.environ.get(
         "CODEX_APP_SERVER_SOCKET",
         str(codex_home() / "app-server-control/app-server-control.sock"),
@@ -318,36 +380,24 @@ async def main():
             )
         )
         marker_path.parent.mkdir(parents=True, exist_ok=True)
-        marker_temporary = marker_path.with_name(f".{marker_path.name}.{os.getpid()}")
-        marker_temporary.write_text(f"{os.stat(socket_path).st_ino}\n")
-        os.replace(marker_temporary, marker_path)
-        pending_thread_lists = set()
-        pending_thread_resumes = {}
-        resume_thread_by_request = {}
-        resume_waiters = {}
-        sender = asyncio.create_task(
-            send_stdin(
-                websocket,
-                pending_thread_lists,
-                pending_thread_resumes,
-                resume_thread_by_request,
-                resume_waiters,
-            )
-        )
-        receiver = asyncio.create_task(
-            receive_stdout(
-                websocket,
-                pending_thread_lists,
-                pending_thread_resumes,
-                resume_thread_by_request,
-                resume_waiters,
-            )
-        )
-        done, pending = await asyncio.wait(
-            (sender, receiver),
-            return_when=asyncio.FIRST_COMPLETED,
-        )
+        temporary = marker_path.with_name(f".{marker_path.name}.{os.getpid()}")
+        temporary.write_text(f"{os.stat(socket_path).st_ino}\n")
+        os.replace(temporary, marker_path)
+        state = {
+            "thread_lists": {},
+            "injected_ids": set(),
+            "pending_resumes": {},
+            "resume_key_by_request": {},
+            "resume_waiters": {},
+            "resume_timeouts": {},
+            "resume_timeout": float(os.environ.get("CODEX_BRIDGE_RESUME_TIMEOUT", "900")),
+        }
+        sender = asyncio.create_task(send_stdin(websocket, state))
+        receiver = asyncio.create_task(receive_stdout(websocket, state))
+        done, pending = await asyncio.wait((sender, receiver), return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
+            task.cancel()
+        for task in state["resume_timeouts"].values():
             task.cancel()
         for task in done:
             task.result()
@@ -355,5 +405,10 @@ async def main():
         await websocket.close()
 
 
+def main() -> None:
+    with frontend_client():
+        asyncio.run(run_bridge())
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

@@ -156,6 +156,26 @@ done
     exit 2
 }
 [[ -d "$workdir" ]] || { echo "Workdir not found: $workdir" >&2; exit 2; }
+
+# Dry-run validates the requested handoff without requiring a live VS Code transport,
+# daemon binary, proxy, or screen session. Discovery is intentionally deferred.
+if $dry_run; then
+    if [[ -S "$daemon_socket" ]]; then
+        dry_mode="shared"
+        dry_app="<daemon>"
+        dry_transport="<daemon>"
+    else
+        dry_mode="initial"
+        dry_app="${app_server_pid:-<auto-discover-on-launch>}"
+        dry_transport="${transport_pid:-<auto-discover-on-launch>}"
+    fi
+    printf 'session_id=%s\nmode=%s\napp_server_pid=%s\ntransport_pid=%s\n' \
+        "$session_id" "$dry_mode" "$dry_app" "$dry_transport"
+    printf 'screen_name=%s\nlog=%s\nprompt=%s\n' \
+        "${screen_name:-<auto>}" "${log_path:-<auto>}" "$prompt"
+    exit 0
+fi
+
 [[ -x "$codex_binary" ]] || { echo "Managed Codex binary is missing." >&2; exit 2; }
 [[ -x "$python_binary" ]] || { echo "Shared Codex Python is missing." >&2; exit 2; }
 command -v screen >/dev/null || { echo "screen is required." >&2; exit 2; }
@@ -194,14 +214,6 @@ state_dir="$codex_home/handoffs"
 [[ -n "$screen_name" ]] || screen_name="codex_handoff_$short_session"
 [[ -n "$log_path" ]] || log_path="$state_dir/${short_session}_${timestamp}.log"
 marker_path="$state_dir/${session_id}.marker.json"
-
-if $dry_run; then
-    printf 'session_id=%s\nmode=%s\napp_server_pid=%s\ntransport_pid=%s\n' \
-        "$session_id" "$($shared_mode && echo shared || echo initial)" \
-        "${app_server_pid:-<daemon>}" "${transport_pid:-<daemon>}"
-    printf 'screen_name=%s\nlog=%s\nprompt=%s\n' "$screen_name" "$log_path" "$prompt"
-    exit 0
-fi
 
 mkdir -p "$state_dir"
 ensure_codex_proxy || {
@@ -272,7 +284,11 @@ fi
         if is_app_server "$app_server_pid"; then
             kill -TERM "$app_server_pid" 2>/dev/null || true
             timeout 15 tail --pid="$app_server_pid" -f /dev/null || true
-            is_app_server "$app_server_pid" && kill -KILL "$app_server_pid" 2>/dev/null || true
+            if is_app_server "$app_server_pid"; then
+                echo "Initial app-server did not exit after SIGTERM; refusing SIGKILL." >&2
+                echo "Close the owning VS Code window or stop that verified process gracefully, then retry." >&2
+                exit 2
+            fi
         fi
     fi
     if [[ -n "$proxy_url" ]]; then

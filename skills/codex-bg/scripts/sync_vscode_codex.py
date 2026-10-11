@@ -35,7 +35,9 @@ CODEX_HOME = pathlib.Path(
 EXTENSION_ROOT = pathlib.Path(
     os.environ.get(
         "CODEX_VSCODE_EXTENSION_ROOT",
-        pathlib.Path.home() / ".vscode-server/extensions",
+        CODEX_HOME / "vscode-server/.vscode-server/extensions"
+        if (CODEX_HOME / "vscode-server/.vscode-server/extensions").is_dir()
+        else pathlib.Path.home() / ".vscode-server/extensions",
     )
 )
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
@@ -407,6 +409,28 @@ def stage_extension_package(extension: pathlib.Path, version: str) -> pathlib.Pa
 def install_extension_package(extension: pathlib.Path, version: str) -> None:
     stage = stage_extension_package(extension, version)
     cli = stage / "bin/codex"
+    if not MANAGED_CLI.is_file():
+        # `daemon update` needs a selected package. Seed it with the official
+        # start command on a fresh install, then stop before binding our socket.
+        if COMPAT_SOCKET.is_symlink() and not COMPAT_SOCKET.is_socket():
+            COMPAT_SOCKET.unlink()
+        initial = subprocess.run(
+            [str(cli), "-c", "features.code_mode_host=true", "app-server", "daemon", "start"],
+            env=daemon_environment(), text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, timeout=90, check=False,
+        )
+        if cli_version(MANAGED_CLI) != version:
+            raise RuntimeError(f"initial daemon package install failed: {initial.stdout.strip()}")
+        stopped = subprocess.run(
+            [str(cli), "app-server", "daemon", "stop"],
+            env=daemon_environment(), text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, timeout=40, check=False,
+        )
+        if stopped.returncode != 0:
+            raise RuntimeError(f"initial daemon stop failed: {stopped.stdout.strip()}")
+        emit("daemon_package_bootstrapped", version=version)
+        shutil.rmtree(stage)
+        return
     result = subprocess.run(
         [
             str(cli),
@@ -502,6 +526,16 @@ def record_guard() -> None:
         raise RuntimeError(f"failed to record daemon guard: {result.stdout.strip()}")
 
 
+def daemon_config_current() -> bool:
+    result = subprocess.run(
+        [str(PYTHON), str(GUARD_SCRIPT), "check", "--codex-home", str(CODEX_HOME),
+         "--socket", str(COMPAT_SOCKET), "--state", str(CONTROL_DIR / "daemon-config.json")],
+        env=daemon_environment(), stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, timeout=30, check=False,
+    )
+    return result.returncode == 0
+
+
 def sync_once(allow_update: bool) -> dict[str, Any]:
     extensions = installed_extensions()
     if not extensions:
@@ -519,8 +553,11 @@ def sync_once(allow_update: bool) -> dict[str, Any]:
     socket_path, runtime_pid = ensure_runtime()
     managed_version = cli_version(MANAGED_CLI)
     updated = False
+    restarted = False
     deferred = False
-    if managed_version != bundled_version:
+    version_changed = managed_version != bundled_version
+    config_changed = socket_path.is_socket() and not daemon_config_current()
+    if version_changed or config_changed:
         client_lock = None
         operation_lock = None
         try:
@@ -539,6 +576,7 @@ def sync_once(allow_update: bool) -> dict[str, Any]:
                     reason = "active-turn"
                 emit(
                     "daemon_update_deferred",
+                    config_changed=config_changed,
                     bundled_version=bundled_version,
                     managed_version=managed_version,
                     reason=reason,
@@ -546,11 +584,13 @@ def sync_once(allow_update: bool) -> dict[str, Any]:
                 )
             else:
                 stop_daemon(socket_path, runtime_pid)
-                install_extension_package(extension, bundled_version)
+                if version_changed:
+                    install_extension_package(extension, bundled_version)
                 socket_path, runtime_pid = ensure_runtime()
                 start_daemon(socket_path, runtime_pid)
                 managed_version = cli_version(MANAGED_CLI)
-                updated = True
+                updated = version_changed
+                restarted = True
         finally:
             release_lock(operation_lock)
             release_lock(client_lock)
@@ -563,12 +603,14 @@ def sync_once(allow_update: bool) -> dict[str, Any]:
             raise RuntimeError("daemon socket exists but its process identity cannot be verified")
         write_pid(pid, runtime_pid)
         live_threads(socket_path)
-    record_guard()
+    if not deferred:
+        record_guard()
     return {
         "extension": str(extension),
         "bundled_version": bundled_version,
         "managed_version": cli_version(MANAGED_CLI),
         "updated": updated,
+        "restarted": restarted,
         "deferred": deferred,
         "socket": str(socket_path),
     }

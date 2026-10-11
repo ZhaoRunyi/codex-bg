@@ -14,7 +14,8 @@
 - **Runtime import fails:** rerun `scripts/bootstrap_runtime.sh` or set `CODEX_BG_PYTHON` to a Python
   containing `websockets`.
 - **Codex binary is not found:** set `CODEX_BINARY` to the exact executable used by the extension.
-- **VS Code logs are elsewhere:** set `VSCODE_LOGS_ROOT` or `VSCODE_AGENT_FOLDER`.
+- **VS Code logs are elsewhere:** set `CODEX_VSCODE_LOG_ROOT` for the ownership
+  guard; set `CODEX_VSCODE_EXTENSION_ROOT` for extension discovery.
 - **Multiple windows:** a successful thread claim is scoped to the target thread and socket inode.
   Reload or close only a window that later reopens or writes that same thread; do not kill unrelated
   app-servers.

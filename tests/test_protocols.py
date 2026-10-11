@@ -48,12 +48,39 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=environment,
+            limit=4 * 1024 * 1024,
         )
 
     async def stop_process(self, process):
         if process.returncode is None:
             process.terminate()
         await asyncio.wait_for(process.wait(), 3)
+
+    async def test_bridge_preserves_response_above_one_mib(self):
+        payload = "z" * (2 * 1024 * 1024)
+
+        async def handler(websocket):
+            try:
+                async for raw in websocket:
+                    request = json.loads(raw)
+                    await websocket.send(json.dumps({
+                        "id": request["id"],
+                        "result": {"thread": {"id": "large", "preview": payload}},
+                    }))
+            except ConnectionClosed:
+                pass
+
+        async with websockets.unix_serve(handler, str(self.socket), max_size=None):
+            process = await self.start_bridge()
+            try:
+                request = {"id": 1, "method": "thread/resume", "params": {"threadId": "large"}}
+                process.stdin.write((json.dumps(request) + "\n").encode())
+                await process.stdin.drain()
+                response = await asyncio.wait_for(process.stdout.readline(), 5)
+                self.assertGreater(len(response), 1024 * 1024)
+                self.assertEqual(json.loads(response)["result"]["thread"]["preview"], payload)
+            finally:
+                await self.stop_process(process)
 
     async def test_bridge_coalesces_only_identical_resume_requests(self):
         received = []

@@ -16,6 +16,18 @@ The runtime is stored outside the skill at
 `${CODEX_HOME:-$HOME/.codex}/skill-runtimes/codex-bg`. Set `CODEX_BG_PYTHON` only when an
 equivalent Python environment already provides `websockets`.
 
+The uv bootstrap selects Python 3.11 instead of the host's `python3`; set
+`CODEX_BG_BOOTSTRAP_PYTHON` to select another compatible Python version. If a sibling
+`.uv/env.sh` exists next to `CODEX_HOME`, it is sourced to use that workspace's uv
+installation and caches. Shell scripts installed from a ZIP may need their executable
+bits restored before launching them.
+
+The synchronizer and ownership guard also discover a VS Code server stored at
+`CODEX_HOME/vscode-server/.vscode-server`. Override extension discovery with
+`CODEX_VSCODE_EXTENSION_ROOT` and ownership logs with `CODEX_VSCODE_LOG_ROOT` when
+the host uses a different layout. Path aliases such as a symlinked home directory
+are resolved when identifying bridge processes.
+
 ## Configure the sidebar
 
 The wrapper's synchronizer changes `chatgpt.cliExecutable` to machine scope in the newest installed

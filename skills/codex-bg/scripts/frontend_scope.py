@@ -50,7 +50,11 @@ parser.add_argument(
     "--vscode-logs",
     default=os.environ.get(
         "CODEX_VSCODE_LOG_ROOT",
-        str(pathlib.Path.home() / ".vscode-server/data/logs"),
+        str(
+            CODEX_HOME / "vscode-server/.vscode-server/data/logs"
+            if (CODEX_HOME / "vscode-server/.vscode-server").is_dir()
+            else pathlib.Path.home() / ".vscode-server/data/logs"
+        ),
     ),
 )
 parser.add_argument("--rpc-timeout", type=float, default=30.0)
@@ -75,7 +79,15 @@ def process_ids(predicate):
 
 
 def is_bridge(arguments):
-    return args.bridge_script.encode() in arguments
+    expected = pathlib.Path(args.bridge_script).resolve()
+    for argument in arguments:
+        if argument.decode(errors="replace").endswith("/jsonl_daemon_bridge.py"):
+            try:
+                if pathlib.Path(os.fsdecode(argument)).resolve() == expected:
+                    return True
+            except OSError:
+                pass
+    return False
 
 
 def is_bundled(arguments):
@@ -245,7 +257,7 @@ def claim_conflict(claimed_at):
     return None
 
 
-def acquire_lock(lock_path):
+def acquire_claim_lock(lock_path):
     lock_handle = lock_path.open("a+")
     deadline = time.monotonic() + args.lock_timeout
     while True:
@@ -310,7 +322,7 @@ if not bridge_ids:
 claim_root = pathlib.Path(args.claim_root)
 claim_root.mkdir(parents=True, exist_ok=True)
 claim_path = claim_root / f"{args.session_id}.json"
-claim_lock = acquire_lock(claim_root / f".{args.session_id}.lock")
+claim_lock = acquire_claim_lock(claim_root / f".{args.session_id}.lock")
 claim = read_claim(claim_path)
 claimed_at = claim["claimed_at"] if claim else bridge_claimed_at
 

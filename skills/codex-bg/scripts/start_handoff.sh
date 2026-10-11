@@ -61,7 +61,6 @@ wait_for_managed_daemon() {
         status="$("$codex_binary" -c features.code_mode_host=true \
             app-server daemon version 2>/dev/null || true)"
         if grep -q '"status":"running"' <<<"$status" \
-            && grep -q '"backend":"pid"' <<<"$status" \
             && [[ -S "$daemon_socket" ]]; then
             return 0
         fi
